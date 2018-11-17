@@ -1,8 +1,7 @@
-package de.hampager.dapnet.service.database;
+package de.hampager.dapnet.service.database.controller;
 
 import java.net.URI;
 import java.time.Instant;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -10,13 +9,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.web.client.RestTemplateBuilder;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -27,10 +21,17 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import de.hampager.dapnet.service.database.AppUser;
+import de.hampager.dapnet.service.database.DbConfig;
+import de.hampager.dapnet.service.database.JsonUtils;
+import de.hampager.dapnet.service.database.MissingFieldException;
+import de.hampager.dapnet.service.database.model.PermissionValue;
 
 /**
  * This class implements the subscribers REST endpoint.
@@ -67,8 +68,8 @@ class SubscriberController extends AbstractController {
 	}
 
 	@GetMapping
-	public ResponseEntity<JsonNode> getAll(Authentication authentication, @RequestParam Map<String, String> params) {
-		ensureAuthenticated(authentication, SUBSCRIBER_READ);
+	public ResponseEntity<JsonNode> getAll(@RequestParam Map<String, String> params) {
+		requirePermission(SUBSCRIBER_READ);
 
 		URI path = buildViewPath("byId", params);
 		JsonNode in = restTemplate.getForObject(path, JsonNode.class);
@@ -86,16 +87,16 @@ class SubscriberController extends AbstractController {
 
 	// TODO: Add view to CouchDB ?
 	@GetMapping("_names")
-	public ResponseEntity<JsonNode> getNames(Authentication authentication) {
-		ensureAuthenticated(authentication, SUBSCRIBER_LIST);
+	public ResponseEntity<JsonNode> getNames() {
+		requirePermission(SUBSCRIBER_LIST);
 
 		JsonNode in = restTemplate.getForObject(namesPath, JsonNode.class);
 		return ResponseEntity.ok(in);
 	}
 
 	@GetMapping("_groups")
-	public ResponseEntity<JsonNode> getGroups(Authentication authentication) {
-		ensureAuthenticated(authentication, SUBSCRIBER_LIST);
+	public ResponseEntity<JsonNode> getGroups() {
+		requirePermission(SUBSCRIBER_LIST);
 
 		JsonNode in = restTemplate.getForObject(groupsPath, JsonNode.class);
 		return ResponseEntity.ok(in);
@@ -103,8 +104,8 @@ class SubscriberController extends AbstractController {
 
 	// TODO: Add view to CouchDB
 	@GetMapping("_descriptions")
-	public ResponseEntity<JsonNode> getDescription(Authentication authentication) {
-		ensureAuthenticated(authentication, SUBSCRIBER_LIST);
+	public ResponseEntity<JsonNode> getDescription() {
+		requirePermission(SUBSCRIBER_LIST);
 
 		JsonNode in = restTemplate.getForObject(descriptionPath, JsonNode.class);
 		return ResponseEntity.ok(in);
@@ -112,8 +113,8 @@ class SubscriberController extends AbstractController {
 
 	// TODO: Add view to CouchDB
 	@GetMapping("_view/byRIC")
-	public ResponseEntity<JsonNode> getbyRIC(Authentication authentication, @RequestParam Map<String, String> params) {
-		ensureAuthenticated(authentication, SUBSCRIBER_READ);
+	public ResponseEntity<JsonNode> getbyRIC(@RequestParam Map<String, String> params) {
+		requirePermission(SUBSCRIBER_READ);
 
 		URI path = buildViewPath("byRIC", params);
 		JsonNode in = restTemplate.getForObject(path, JsonNode.class);
@@ -130,64 +131,76 @@ class SubscriberController extends AbstractController {
 	}
 
 	@GetMapping("{name}")
-	public ResponseEntity<JsonNode> getSubscriber(Authentication authentication, @PathVariable String subscriber) {
-		ensureAuthenticated(authentication, SUBSCRIBER_READ, subscriber);
+	public ResponseEntity<JsonNode> getSubscriber(@PathVariable String subscriber) {
+		final AppUser appUser = getCurrentUser();
+		final PermissionValue permission = appUser.getPermissions().getOrDefault(SUBSCRIBER_READ, PermissionValue.NONE);
+		if (permission == PermissionValue.NONE || permission == PermissionValue.LIMITED) {
+			throw new HttpServerErrorException(HttpStatus.FORBIDDEN);
+		}
 
 		JsonNode in = restTemplate.getForObject(paramPath, JsonNode.class, subscriber);
-		return ResponseEntity.ok(in);
+		if (permission == PermissionValue.ALL
+				|| (permission == PermissionValue.IF_OWNER && JsonUtils.isOwner(in, appUser.getUsername()))) {
+			return ResponseEntity.ok(in);
+		} else {
+			throw new HttpServerErrorException(HttpStatus.FORBIDDEN);
+		}
 	}
 
 	@PutMapping
-	public ResponseEntity<JsonNode> putSubscriber(Authentication authentication, @RequestBody JsonNode subscriber) {
+	public ResponseEntity<JsonNode> putSubscriber(@RequestBody JsonNode subscriber) {
 		if (subscriber.has("_rev")) {
-			return updateSubscriber(authentication, subscriber);
+			return updateSubscriber(subscriber);
 		} else {
-			return createSubscriber(authentication, subscriber);
+			return createSubscriber(subscriber);
 		}
 	}
 
 	// UNTESTED
-	private ResponseEntity<JsonNode> createSubscriber(Authentication auth, JsonNode subscriber) {
-		ensureAuthenticated(auth, SUBSCRIBER_CREATE);
+	private ResponseEntity<JsonNode> createSubscriber(JsonNode subscriber) {
+		requirePermission(SUBSCRIBER_CREATE, PermissionValue.ALL);
+		final AppUser appUser = getCurrentUser();
 
 		try {
-			JsonUtils.validateRequiredFields(subscriber, REQUIRED_KEYS_CREATE);
+			JsonUtils.checkRequiredFields(subscriber, REQUIRED_KEYS_CREATE);
 		} catch (MissingFieldException ex) {
 			throw new HttpServerErrorException(HttpStatus.BAD_REQUEST, ex.getMessage());
 		}
 
-		ObjectNode modSubscriber;
-		try {
-			modSubscriber = (ObjectNode) subscriber;
-		} catch (ClassCastException ex) {
-			logger.error("Failed to cast JsonNode to ObjectNode");
-			throw new HttpServerErrorException(HttpStatus.BAD_REQUEST);
-		}
-
-		modSubscriber.put("_id", modSubscriber.get("_id").asText().replaceAll("\\s+", "").toLowerCase());
-		// Convert _id to lowercase and remove all whitespaces
+		final ObjectNode modSubscriber = (ObjectNode) JsonUtils.trimValues(subscriber);
+		final String subsriberId = modSubscriber.get("_id").asText().toLowerCase();
+		modSubscriber.put("_id", subsriberId);
 
 		final String ts = Instant.now().toString();
 		modSubscriber.put("created_on", ts);
-		modSubscriber.put("created_by", auth.getName());
+		modSubscriber.put("created_by", appUser.getUsername());
 		modSubscriber.put("changed_on", ts);
-		modSubscriber.put("changed_by", auth.getName());
+		modSubscriber.put("changed_by", appUser.getUsername());
 
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
-		headers.setAccept(List.of(MediaType.APPLICATION_JSON));
-		HttpEntity<JsonNode> request = new HttpEntity<JsonNode>(modSubscriber, headers);
-		return restTemplate.exchange(paramPath, HttpMethod.PUT, request, JsonNode.class,
-				modSubscriber.get("_id").asText());
+		final ResponseEntity<JsonNode> db = performPut(subsriberId, modSubscriber);
+		if (db.getStatusCode() == HttpStatus.CREATED) {
+			final URI location = ServletUriComponentsBuilder.fromCurrentRequest().path("{id}")
+					.buildAndExpand(subsriberId).toUri();
+			return ResponseEntity.created(location).body(db.getBody());
+		} else {
+			return ResponseEntity.status(db.getStatusCode()).body(db.getBody());
+		}
 	}
 
 	// UNTESTED
-	private ResponseEntity<JsonNode> updateSubscriber(Authentication auth, JsonNode subscriberUpdate) {
-		ensureAuthenticated(auth, SUBSCRIBER_UPDATE, auth.getName());
+	private ResponseEntity<JsonNode> updateSubscriber(JsonNode subscriberUpdate) {
+		final PermissionValue permission = requirePermission(SUBSCRIBER_UPDATE, PermissionValue.ALL,
+				PermissionValue.IF_OWNER);
+		final AppUser appUser = getCurrentUser();
 
-		final String subscriberId = subscriberUpdate.get("_id").asText();
+		subscriberUpdate = JsonUtils.trimValues(subscriberUpdate);
 
-		JsonNode oldSubscriber = restTemplate.getForObject(paramPath, JsonNode.class, subscriberId);
+		final String subscriberId = subscriberUpdate.get("_id").asText().toLowerCase();
+		final JsonNode oldSubscriber = restTemplate.getForObject(paramPath, JsonNode.class, subscriberId);
+		if (permission == PermissionValue.IF_OWNER && !JsonUtils.isOwner(oldSubscriber, appUser.getUsername())) {
+			throw new HttpServerErrorException(HttpStatus.FORBIDDEN);
+		}
+
 		ObjectNode modSubscriber;
 		try {
 			modSubscriber = (ObjectNode) oldSubscriber;
@@ -203,22 +216,31 @@ class SubscriberController extends AbstractController {
 		});
 
 		modSubscriber.put("changed_on", Instant.now().toString());
-		modSubscriber.put("changed_by", auth.getName());
+		modSubscriber.put("changed_by", appUser.getUsername());
 
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
-		headers.setAccept(List.of(MediaType.APPLICATION_JSON));
-		HttpEntity<JsonNode> request = new HttpEntity<JsonNode>(modSubscriber, headers);
-		return restTemplate.exchange(paramPath, HttpMethod.PUT, request, JsonNode.class, subscriberId);
+		final ResponseEntity<JsonNode> db = performPut(subscriberId, modSubscriber);
+		return ResponseEntity.status(db.getStatusCode()).body(db.getBody());
 	}
 
 	// UNTESTED
 	@DeleteMapping("{name}")
-	public ResponseEntity<String> deleteSubscriber(Authentication authentication, @PathVariable String name,
-			@RequestParam String rev) {
-		ensureAuthenticated(authentication, SUBSCRIBER_DELETE, name);
+	public ResponseEntity<JsonNode> deleteSubscriber(@PathVariable String name, @RequestParam String revision) {
+		final AppUser user = getCurrentUser();
+		final PermissionValue permission = user.getPermissions().getOrDefault(SUBSCRIBER_DELETE, PermissionValue.NONE);
+
+		boolean canDelete = permission == PermissionValue.ALL;
+		if (permission == PermissionValue.IF_OWNER) {
+			// TODO Handle revision
+			final JsonNode oldRubric = restTemplate.getForObject(paramPath, JsonNode.class, name);
+			canDelete = JsonUtils.isOwner(oldRubric, user.getUsername());
+		}
+
+		if (!canDelete) {
+			throw new HttpServerErrorException(HttpStatus.FORBIDDEN);
+		}
 
 		// TODO Delete referenced objects
-		return restTemplate.exchange(paramPath, HttpMethod.DELETE, null, String.class, name);
+		final ResponseEntity<JsonNode> db = performDelete(name, revision);
+		return ResponseEntity.status(db.getStatusCode()).body(db.getBody());
 	}
 }

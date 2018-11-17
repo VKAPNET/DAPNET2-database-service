@@ -1,8 +1,7 @@
-package de.hampager.dapnet.service.database;
+package de.hampager.dapnet.service.database.controller;
 
 import java.net.URI;
 import java.time.Instant;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -10,13 +9,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.web.client.RestTemplateBuilder;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -27,15 +21,22 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import de.hampager.dapnet.service.database.AppUser;
+import de.hampager.dapnet.service.database.DbConfig;
+import de.hampager.dapnet.service.database.JsonUtils;
+import de.hampager.dapnet.service.database.MissingFieldException;
+import de.hampager.dapnet.service.database.model.PermissionValue;
+
 @CrossOrigin
 @RestController
 @RequestMapping("nodes")
-class NodeController extends AbstractController {
+public class NodeController extends AbstractController {
 
 	private static final Logger logger = LoggerFactory.getLogger(NodeController.class);
 	private static final Set<String> VALID_KEYS_UPDATE = Set.of("auth_key", "coordinates", "hamcloud", "owners",
@@ -43,7 +44,6 @@ class NodeController extends AbstractController {
 	private static final String[] REQUIRED_KEYS_CREATE = { "_id", "auth_key", "coordinates", "hamcloud", "owners" };
 	private static final String NODE_LIST = "node.list";
 	private static final String NODE_READ = "node.read";
-	private static final String NODE_READ_FULL = "node.read_full";
 	private static final String NODE_UPDATE = "node.update";
 	private static final String NODE_CREATE = "node.create";
 	private static final String NODE_DELETE = "node.delete";
@@ -59,11 +59,9 @@ class NodeController extends AbstractController {
 	}
 
 	@GetMapping
-	public ResponseEntity<JsonNode> getAll(Authentication authentication, @RequestParam Map<String, String> params) {
-		boolean readFullAllowed = isAuthenticated(authentication, NODE_READ_FULL);
-		if (!readFullAllowed) {
-			ensureAuthenticated(authentication, NODE_READ);
-		}
+	public ResponseEntity<JsonNode> getAll(@RequestParam Map<String, String> params) {
+		final PermissionValue permission = requirePermission(NODE_READ);
+		final boolean hideFields = permission != PermissionValue.ALL;
 
 		URI path = buildViewPath("byId", params);
 		JsonNode in = restTemplate.getForObject(path, JsonNode.class);
@@ -73,7 +71,7 @@ class NodeController extends AbstractController {
 		ArrayNode rows = out.putArray("rows");
 		for (JsonNode n : in.get("rows")) {
 			JsonNode doc = n.get("doc");
-			if (!readFullAllowed) {
+			if (hideFields) {
 				((ObjectNode) doc).remove("auth_key");
 			}
 			rows.add(doc);
@@ -83,30 +81,32 @@ class NodeController extends AbstractController {
 	}
 
 	@GetMapping("_names")
-	public ResponseEntity<JsonNode> getNodenames(Authentication authentication) {
-		ensureAuthenticated(authentication, NODE_LIST);
+	public ResponseEntity<JsonNode> getNodenames() {
+		requirePermission(NODE_LIST, PermissionValue.ALL);
 
 		JsonNode in = restTemplate.getForObject(namePath, JsonNode.class);
 		return ResponseEntity.ok(in);
 	}
 
 	@GetMapping("_descriptions")
-	public ResponseEntity<JsonNode> getNodenamesDescription(Authentication authentication) {
-		ensureAuthenticated(authentication, NODE_LIST);
+	public ResponseEntity<JsonNode> getNodenamesDescription() {
+		requirePermission(NODE_LIST, PermissionValue.ALL);
 
 		JsonNode in = restTemplate.getForObject(descriptionPath, JsonNode.class);
 		return ResponseEntity.ok(in);
 	}
 
 	@GetMapping("{nodename}")
-	public ResponseEntity<JsonNode> getNode(Authentication authentication, @PathVariable String nodename) {
-		boolean readFullAllowed = isAuthenticated(authentication, NODE_READ_FULL, nodename);
-		if (!readFullAllowed) {
-			ensureAuthenticated(authentication, NODE_READ, nodename);
+	public ResponseEntity<JsonNode> getNode(@PathVariable String nodename) {
+		final AppUser appUser = getCurrentUser();
+		final PermissionValue permission = appUser.getPermissions().getOrDefault(NODE_READ, PermissionValue.NONE);
+		if (permission == PermissionValue.NONE) {
+			throw new HttpServerErrorException(HttpStatus.FORBIDDEN);
 		}
 
 		JsonNode in = restTemplate.getForObject(paramPath, JsonNode.class, nodename);
-		if (!readFullAllowed) {
+		if ((permission == PermissionValue.IF_OWNER && !JsonUtils.isOwner(in, appUser.getUsername()))
+				|| permission != PermissionValue.ALL) {
 			((ObjectNode) in).remove("auth_key");
 		}
 
@@ -114,71 +114,70 @@ class NodeController extends AbstractController {
 	}
 
 	@PutMapping
-	public ResponseEntity<JsonNode> putNode(Authentication authentication, @RequestBody JsonNode node) {
+	public ResponseEntity<JsonNode> putNode(@RequestBody JsonNode node) {
 		if (node.has("_rev")) {
-			return updateNode(authentication, node);
+			return updateNode(node);
 		} else {
-			return createNode(authentication, node);
+			return createNode(node);
 		}
 	}
 
-	private ResponseEntity<JsonNode> createNode(Authentication auth, JsonNode node) {
-		ensureAuthenticated(auth, NODE_CREATE);
+	private ResponseEntity<JsonNode> createNode(JsonNode node) {
+		requirePermission(NODE_CREATE, PermissionValue.ALL);
+		final AppUser appUser = getCurrentUser();
 
 		try {
-			JsonUtils.validateRequiredFields(node, REQUIRED_KEYS_CREATE);
+			JsonUtils.checkRequiredFields(node, REQUIRED_KEYS_CREATE);
 		} catch (MissingFieldException ex) {
 			throw new HttpServerErrorException(HttpStatus.BAD_REQUEST, ex.getMessage());
 		}
 
+		final ObjectNode modNode = (ObjectNode) JsonUtils.trimValues(node);
+		final String nodeId = modNode.get("_id").asText().toLowerCase();
+		modNode.put("_id", nodeId);
+
 		// Check if owners field is populated
-		JsonNode ownersNode = node.get("owners");
+		final JsonNode ownersNode = modNode.get("owners");
 		if (!ownersNode.isArray() || !ownersNode.elements().hasNext()) {
-			String nodeId = node.get("_id").asText();
 			throw new HttpServerErrorException(HttpStatus.BAD_REQUEST,
 					"Owners list is empty or missing for node id " + nodeId);
 		}
 
-		ObjectNode modNode;
-		try {
-			modNode = (ObjectNode) node;
-		} catch (ClassCastException ex) {
-			logger.error("Failed to cast JsonNode to ObjectNode");
-			throw new HttpServerErrorException(HttpStatus.BAD_REQUEST);
-		}
-
-		// Convert _id to lowercase and remove all whitespaces
-		modNode.put("_id", modNode.get("_id").asText().replaceAll("\\s+", "").toLowerCase());
-
-		// Remove whitespaces from owner array entries
-		// TODO: Make it work
-		// modNode.put(SanitizeUtils.removeWhiteSpacefromArray(modNode.get("owners"));
-
 		final String ts = Instant.now().toString();
 		modNode.put("created_on", ts);
-		modNode.put("created_by", auth.getName());
+		modNode.put("created_by", appUser.getUsername());
 		modNode.put("changed_on", ts);
-		modNode.put("changed_by", auth.getName());
+		modNode.put("changed_by", appUser.getUsername());
 
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
-		headers.setAccept(List.of(MediaType.APPLICATION_JSON));
-		HttpEntity<JsonNode> request = new HttpEntity<JsonNode>(modNode, headers);
-		return restTemplate.exchange(paramPath, HttpMethod.PUT, request, JsonNode.class, modNode.get("_id").asText());
+		final ResponseEntity<JsonNode> db = performPut(nodeId, modNode);
+		if (db.getStatusCode() == HttpStatus.CREATED) {
+			final URI location = ServletUriComponentsBuilder.fromCurrentRequest().path("{id}").buildAndExpand(nodeId)
+					.toUri();
+			return ResponseEntity.created(location).body(db.getBody());
+		} else {
+			return ResponseEntity.status(db.getStatusCode()).body(db.getBody());
+		}
 	}
 
-	private ResponseEntity<JsonNode> updateNode(Authentication auth, JsonNode nodeUpdate) {
-		ensureAuthenticated(auth, NODE_UPDATE, auth.getName());
+	private ResponseEntity<JsonNode> updateNode(JsonNode nodeUpdate) {
+		final PermissionValue permission = requirePermission(NODE_UPDATE, PermissionValue.ALL,
+				PermissionValue.IF_OWNER);
+		final AppUser appUser = getCurrentUser();
 
-		JsonNode ownersNode = nodeUpdate.get("owners");
-		if (ownersNode == null || !ownersNode.isArray() || !ownersNode.elements().hasNext()) {
-			String nodeId = nodeUpdate.get("_id").asText();
+		nodeUpdate = JsonUtils.trimValues(nodeUpdate);
+
+		final String nodeId = nodeUpdate.get("_id").asText().toLowerCase();
+
+		final JsonNode ownersNode = nodeUpdate.get("owners");
+		if (ownersNode != null && (!ownersNode.isArray() || !ownersNode.elements().hasNext())) {
 			throw new HttpServerErrorException(HttpStatus.BAD_REQUEST, "Owners list is empty " + nodeId);
 		}
 
-		final String nodeId = nodeUpdate.get("_id").asText();
+		final JsonNode oldNode = restTemplate.getForObject(paramPath, JsonNode.class, nodeId);
+		if (permission == PermissionValue.IF_OWNER && !JsonUtils.isOwner(oldNode, appUser.getUsername())) {
+			throw new HttpServerErrorException(HttpStatus.FORBIDDEN);
+		}
 
-		JsonNode oldNode = restTemplate.getForObject(paramPath, JsonNode.class, nodeId);
 		ObjectNode modNode;
 		try {
 			modNode = (ObjectNode) oldNode;
@@ -194,22 +193,29 @@ class NodeController extends AbstractController {
 		});
 
 		modNode.put("changed_on", Instant.now().toString());
-		modNode.put("changed_by", auth.getName());
+		modNode.put("changed_by", appUser.getUsername());
 
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
-		headers.setAccept(List.of(MediaType.APPLICATION_JSON));
-		HttpEntity<JsonNode> request = new HttpEntity<JsonNode>(modNode, headers);
-		return restTemplate.exchange(paramPath, HttpMethod.PUT, request, JsonNode.class, nodeId);
+		final ResponseEntity<JsonNode> db = performPut(nodeId, modNode);
+		return ResponseEntity.status(db.getStatusCode()).body(db.getBody());
 	}
 
 	@DeleteMapping("{nodename}")
-	public ResponseEntity<String> deleteNode(Authentication authentication, @PathVariable String nodename,
-			@RequestParam String rev) {
-		ensureAuthenticated(authentication, NODE_DELETE, nodename);
+	public ResponseEntity<JsonNode> deleteNode(@PathVariable String nodename, @RequestParam String revision) {
+		final AppUser user = getCurrentUser();
+		final PermissionValue permission = user.getPermissions().getOrDefault(NODE_DELETE, PermissionValue.NONE);
+		boolean canDelete = permission == PermissionValue.ALL;
+		if (permission == PermissionValue.IF_OWNER) {
+			final JsonNode oldNode = restTemplate.getForObject(paramPath, JsonNode.class, nodename);
+			canDelete = JsonUtils.isOwner(oldNode, user.getUsername());
+		}
+
+		if (!canDelete) {
+			throw new HttpServerErrorException(HttpStatus.FORBIDDEN);
+		}
 
 		// TODO Delete referenced objects
-		return restTemplate.exchange(paramPath, HttpMethod.DELETE, null, String.class, nodename);
+		final ResponseEntity<JsonNode> db = performDelete(nodename, revision);
+		return ResponseEntity.status(db.getStatusCode()).body(db.getBody());
 	}
 
 }

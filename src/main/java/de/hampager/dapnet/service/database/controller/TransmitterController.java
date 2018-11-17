@@ -1,20 +1,15 @@
-package de.hampager.dapnet.service.database;
+package de.hampager.dapnet.service.database.controller;
 
+import java.net.URI;
 import java.time.Instant;
-import java.util.List;
 import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.web.client.RestTemplateBuilder;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -25,9 +20,16 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import de.hampager.dapnet.service.database.AppUser;
+import de.hampager.dapnet.service.database.DbConfig;
+import de.hampager.dapnet.service.database.JsonUtils;
+import de.hampager.dapnet.service.database.MissingFieldException;
+import de.hampager.dapnet.service.database.model.PermissionValue;
 
 /**
  * This class implements the transmitters REST endpoint.
@@ -62,72 +64,75 @@ class TransmitterController extends AbstractController {
 	}
 
 	@GetMapping("_names")
-	public ResponseEntity<JsonNode> getNames(Authentication authentication) {
-		ensureAuthenticated(authentication, TRANSMITTER_LIST);
+	public ResponseEntity<JsonNode> getNames() {
+		requirePermission(TRANSMITTER_LIST);
 
 		JsonNode in = restTemplate.getForObject(namesPath, JsonNode.class);
 		return ResponseEntity.ok(in);
 	}
 
 	@GetMapping("_groups")
-	public ResponseEntity<JsonNode> getGroups(Authentication authentication) {
-		ensureAuthenticated(authentication, TRANSMITTER_LIST);
+	public ResponseEntity<JsonNode> getGroups() {
+		requirePermission(TRANSMITTER_LIST);
 
 		JsonNode in = restTemplate.getForObject(groupsPath, JsonNode.class);
 		return ResponseEntity.ok(in);
 	}
 
 	@PutMapping
-	public ResponseEntity<JsonNode> putTransmitter(Authentication authentication, @RequestBody JsonNode transmitter) {
+	public ResponseEntity<JsonNode> putTransmitter(@RequestBody JsonNode transmitter) {
 		if (transmitter.has("_rev")) {
-			return updateTransmitter(authentication, transmitter);
+			return updateTransmitter(transmitter);
 		} else {
-			return createTransmitter(authentication, transmitter);
+			return createTransmitter(transmitter);
 		}
 	}
 
 	// UNTESTED
-	private ResponseEntity<JsonNode> createTransmitter(Authentication auth, JsonNode transmitter) {
-		ensureAuthenticated(auth, TRANSMITTER_CREATE);
+	private ResponseEntity<JsonNode> createTransmitter(JsonNode transmitter) {
+		requirePermission(TRANSMITTER_CREATE, PermissionValue.ALL);
+		final AppUser appUser = getCurrentUser();
 
 		try {
-			JsonUtils.validateRequiredFields(transmitter, REQUIRED_KEYS_CREATE);
+			JsonUtils.checkRequiredFields(transmitter, REQUIRED_KEYS_CREATE);
 		} catch (MissingFieldException ex) {
 			throw new HttpServerErrorException(HttpStatus.BAD_REQUEST, ex.getMessage());
 		}
 
-		ObjectNode modTransmitter;
-		try {
-			modTransmitter = (ObjectNode) transmitter;
-		} catch (ClassCastException ex) {
-			logger.error("Failed to cast JsonNode to ObjectNode");
-			throw new HttpServerErrorException(HttpStatus.BAD_REQUEST);
-		}
-
-		modTransmitter.put("_id", modTransmitter.get("_id").asText().replaceAll("\\s+", "").toLowerCase());
-		// Convert _id to lowercase and remove all whitespaces
+		final ObjectNode modTransmitter = (ObjectNode) JsonUtils.trimValues(transmitter);
+		final String transmitterId = modTransmitter.get("_id").asText().toLowerCase();
+		modTransmitter.put("_id", transmitterId);
 
 		final String ts = Instant.now().toString();
 		modTransmitter.put("created_on", ts);
-		modTransmitter.put("created_by", auth.getName());
+		modTransmitter.put("created_by", appUser.getUsername());
 		modTransmitter.put("changed_on", ts);
-		modTransmitter.put("changed_by", auth.getName());
+		modTransmitter.put("changed_by", appUser.getUsername());
 
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
-		headers.setAccept(List.of(MediaType.APPLICATION_JSON));
-		HttpEntity<JsonNode> request = new HttpEntity<JsonNode>(modTransmitter, headers);
-		return restTemplate.exchange(paramPath, HttpMethod.PUT, request, JsonNode.class,
-				modTransmitter.get("_id").asText());
+		final ResponseEntity<JsonNode> db = performPut(transmitterId, modTransmitter);
+		if (db.getStatusCode() == HttpStatus.CREATED) {
+			final URI location = ServletUriComponentsBuilder.fromCurrentRequest().path("{id}")
+					.buildAndExpand(transmitterId).toUri();
+			return ResponseEntity.created(location).body(db.getBody());
+		} else {
+			return ResponseEntity.status(db.getStatusCode()).body(db.getBody());
+		}
 	}
 
 	// UNTESTED
-	private ResponseEntity<JsonNode> updateTransmitter(Authentication auth, JsonNode transmitterUpdate) {
-		ensureAuthenticated(auth, TRANSMITTER_UPDATE, auth.getName());
+	private ResponseEntity<JsonNode> updateTransmitter(JsonNode transmitterUpdate) {
+		final PermissionValue permission = requirePermission(TRANSMITTER_UPDATE, PermissionValue.ALL,
+				PermissionValue.IF_OWNER);
+		final AppUser appUser = getCurrentUser();
 
-		final String transmitterId = transmitterUpdate.get("_id").asText();
+		transmitterUpdate = JsonUtils.trimValues(transmitterUpdate);
 
-		JsonNode oldTransmitter = restTemplate.getForObject(paramPath, JsonNode.class, transmitterId);
+		final String transmitterId = transmitterUpdate.get("_id").asText().toLowerCase();
+		final JsonNode oldTransmitter = restTemplate.getForObject(paramPath, JsonNode.class, transmitterId);
+		if (permission == PermissionValue.IF_OWNER && !JsonUtils.isOwner(oldTransmitter, appUser.getUsername())) {
+			throw new HttpServerErrorException(HttpStatus.FORBIDDEN);
+		}
+
 		ObjectNode modTransmitter;
 		try {
 			modTransmitter = (ObjectNode) oldTransmitter;
@@ -143,22 +148,30 @@ class TransmitterController extends AbstractController {
 		});
 
 		modTransmitter.put("changed_on", Instant.now().toString());
-		modTransmitter.put("changed_by", auth.getName());
+		modTransmitter.put("changed_by", appUser.getUsername());
 
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
-		headers.setAccept(List.of(MediaType.APPLICATION_JSON));
-		HttpEntity<JsonNode> request = new HttpEntity<JsonNode>(modTransmitter, headers);
-		return restTemplate.exchange(paramPath, HttpMethod.PUT, request, JsonNode.class, transmitterId);
+		final ResponseEntity<JsonNode> db = performPut(transmitterId, modTransmitter);
+		return ResponseEntity.status(db.getStatusCode()).body(db.getBody());
 	}
 
 	// UNTESTED
 	@DeleteMapping("{name}")
-	public ResponseEntity<String> deleteTransmitter(Authentication authentication, @PathVariable String name,
-			@RequestParam String rev) {
-		ensureAuthenticated(authentication, TRANSMITTER_DELETE, name);
+	public ResponseEntity<JsonNode> deleteTransmitter(@PathVariable String name, @RequestParam String revision) {
+		final AppUser user = getCurrentUser();
+		final PermissionValue permission = user.getPermissions().getOrDefault(TRANSMITTER_DELETE, PermissionValue.NONE);
+		boolean canDelete = permission == PermissionValue.ALL;
+		if (permission == PermissionValue.IF_OWNER) {
+			// TODO Handle revision
+			final JsonNode oldRubric = restTemplate.getForObject(paramPath, JsonNode.class, name);
+			canDelete = JsonUtils.isOwner(oldRubric, user.getUsername());
+		}
+
+		if (!canDelete) {
+			throw new HttpServerErrorException(HttpStatus.FORBIDDEN);
+		}
 
 		// TODO Delete referenced objects
-		return restTemplate.exchange(paramPath, HttpMethod.DELETE, null, String.class, name);
+		final ResponseEntity<JsonNode> db = performDelete(name, revision);
+		return ResponseEntity.status(db.getStatusCode()).body(db.getBody());
 	}
 }
